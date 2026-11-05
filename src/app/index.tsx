@@ -6,24 +6,21 @@ import { type ComponentRef, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+const LANGUAGE = 'hi-IN';
+
 // Silence ends a recognition session on Android. These are normal, so we just restart.
 const SILENCE_ERRORS = ['no-speech', 'speech-timeout'];
-
-function getEngineName() {
-  try {
-    return ExpoSpeechRecognitionModule.getDefaultRecognitionService().packageName;
-  } catch {
-    return 'unknown';
-  }
-}
 
 export default function CaptionsScreen() {
   const [lines, setLines] = useState<string[]>([]);
   const [interim, setInterim] = useState('');
   const [listening, setListening] = useState(false);
   const [error, setError] = useState('');
-  const [engine] = useState(getEngineName);
 
+  const [onDevice, setOnDevice] = useState(false);
+
+  const useOnDevice = useRef(false);
+  const downloadRequested = useRef(false);
   const wantsToListen = useRef(false);
   const interimRef = useRef('');
   const scrollRef = useRef<ComponentRef<typeof ScrollView>>(null);
@@ -41,10 +38,31 @@ export default function CaptionsScreen() {
 
   const startRecognizer = () => {
     ExpoSpeechRecognitionModule.start({
-      lang: 'hi-IN',
+      lang: LANGUAGE,
       interimResults: true,
       continuous: true,
+      // Punctuation is only known to work on Android with on-device recognition.
+      addsPunctuation: true,
+      requiresOnDeviceRecognition: useOnDevice.current,
     });
+  };
+
+  const hasHindiModel = async () => {
+    try {
+      const { installedLocales } = await ExpoSpeechRecognitionModule.getSupportedLocales({});
+      return installedLocales.includes(LANGUAGE);
+    } catch {
+      return false;
+    }
+  };
+
+  // Asks only once per app launch, and doesn't wait: captions run online until the model arrives.
+  const requestHindiModel = () => {
+    if (downloadRequested.current) return;
+    downloadRequested.current = true;
+    ExpoSpeechRecognitionModule.androidTriggerOfflineModelDownload({ locale: LANGUAGE }).catch(
+      (e) => setError(`Could not download the Hindi model: ${String(e)}`),
+    );
   };
 
   useSpeechRecognitionEvent('result', (event) => {
@@ -58,6 +76,8 @@ export default function CaptionsScreen() {
 
   useSpeechRecognitionEvent('error', (event) => {
     if (SILENCE_ERRORS.includes(event.error)) return;
+    // The on-device recognizer reports this when we stop it, so it isn't a real problem.
+    if (event.error === 'client' && !wantsToListen.current) return;
     wantsToListen.current = false;
     setError(`${event.error}: ${event.message}`);
   });
@@ -79,6 +99,10 @@ export default function CaptionsScreen() {
       setError('Microphone permission is needed to show captions.');
       return;
     }
+    const hasModel = await hasHindiModel();
+    useOnDevice.current = hasModel;
+    setOnDevice(hasModel);
+    if (!hasModel) requestHindiModel();
     wantsToListen.current = true;
     setListening(true);
     startRecognizer();
@@ -87,6 +111,11 @@ export default function CaptionsScreen() {
   const stop = () => {
     wantsToListen.current = false;
     ExpoSpeechRecognitionModule.stop();
+  };
+
+  const clear = () => {
+    setLines([]);
+    showInterim('');
   };
 
   return (
@@ -104,7 +133,9 @@ export default function CaptionsScreen() {
       </ScrollView>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      <Text style={styles.engine}>Engine: {engine}</Text>
+      <Text style={styles.engine}>
+        Engine: {onDevice ? 'on-device' : 'online (Hindi model not installed)'}
+      </Text>
 
       <View style={styles.controls}>
         <Pressable
@@ -112,6 +143,12 @@ export default function CaptionsScreen() {
           onPress={listening ? stop : start}
           style={[styles.button, listening && styles.buttonStop]}>
           <Text style={styles.buttonText}>{listening ? 'Stop' : 'Start'}</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          onPress={clear}
+          style={[styles.button, styles.buttonClear]}>
+          <Text style={styles.buttonText}>Clear</Text>
         </Pressable>
       </View>
     </SafeAreaView>
@@ -147,16 +184,22 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   controls: {
+    flexDirection: 'row',
+    gap: 12,
     paddingBottom: 16,
   },
   button: {
     alignItems: 'center',
     backgroundColor: '#1565C0',
     borderRadius: 12,
+    flex: 1,
     paddingVertical: 16,
   },
   buttonStop: {
     backgroundColor: '#B71C1C',
+  },
+  buttonClear: {
+    backgroundColor: '#424242',
   },
   buttonText: {
     color: '#FFFFFF',
