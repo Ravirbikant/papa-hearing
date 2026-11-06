@@ -2,9 +2,22 @@ import {
   ExpoSpeechRecognitionModule,
   useSpeechRecognitionEvent,
 } from 'expo-speech-recognition';
-import { type ComponentRef, useRef, useState } from 'react';
+import { type ComponentRef, useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+
+import { EditLineModal } from '@/components/edit-line-modal';
+import { FixesPanel } from '@/components/fixes-panel';
+import {
+  type Corrections,
+  loadCorrections,
+  NO_CORRECTIONS,
+  saveCorrections,
+} from '@/corrections-store';
+import { showEnglishWords } from '@/english-words';
+import { buildFixer, findFixes } from '@/learn-fixes';
+
+type Line = { id: string; raw: string; corrected?: string };
 
 const LANGUAGE = 'hi-IN';
 
@@ -12,18 +25,41 @@ const LANGUAGE = 'hi-IN';
 const SILENCE_ERRORS = ['no-speech', 'speech-timeout'];
 
 export default function CaptionsScreen() {
-  const [lines, setLines] = useState<string[]>([]);
+  const [lines, setLines] = useState<Line[]>([]);
   const [interim, setInterim] = useState('');
   const [listening, setListening] = useState(false);
   const [error, setError] = useState('');
 
   const [onDevice, setOnDevice] = useState(false);
 
+  const [corrections, setCorrections] = useState<Corrections>(NO_CORRECTIONS);
+  const [editingLine, setEditingLine] = useState<Line | null>(null);
+  const [showFixes, setShowFixes] = useState(false);
+
+  const correctionsLoaded = useRef(false);
+  const nextLineNumber = useRef(0);
   const useOnDevice = useRef(false);
   const downloadRequested = useRef(false);
   const wantsToListen = useRef(false);
   const interimRef = useRef('');
   const scrollRef = useRef<ComponentRef<typeof ScrollView>>(null);
+
+  useEffect(() => {
+    loadCorrections()
+      .then((saved) => {
+        correctionsLoaded.current = true;
+        setCorrections(saved);
+      })
+      .catch((e) => setError(`Could not load saved fixes: ${String(e)}`));
+  }, []);
+
+  useEffect(() => {
+    if (!correctionsLoaded.current) return;
+    saveCorrections(corrections).catch((e) => setError(`Could not save fixes: ${String(e)}`));
+  }, [corrections]);
+
+  const applyFixes = useMemo(() => buildFixer(findFixes(corrections.edits)), [corrections.edits]);
+  const toShownText = (raw: string) => applyFixes(showEnglishWords(raw));
 
   const showInterim = (text: string) => {
     interimRef.current = text;
@@ -31,9 +67,37 @@ export default function CaptionsScreen() {
   };
 
   const addLine = (text: string) => {
-    const line = text.trim();
-    if (line) setLines((current) => [...current, line]);
+    const raw = text.trim();
+    if (raw) {
+      const id = `${Date.now()}-${nextLineNumber.current++}`;
+      setLines((current) => [...current, { id, raw }]);
+      setCorrections((current) => ({ ...current, linesSeen: current.linesSeen + 1 }));
+    }
     showInterim('');
+  };
+
+  const saveEdit = (line: Line, text: string) => {
+    setEditingLine(null);
+    const corrected = text.trim();
+    if (!corrected) return;
+
+    setCorrections((current) => {
+      const existing = current.edits.find(({ id }) => id === line.id);
+      const others = current.edits.filter(({ id }) => id !== line.id);
+      // Keep the text from the first edit, so editing a line twice doesn't count as two fixes.
+      const shown = existing?.shown ?? toShownText(line.raw);
+      if (corrected === shown) return { ...current, edits: others };
+      const edit = { id: line.id, raw: line.raw, shown, corrected, at: new Date().toISOString() };
+      return { ...current, edits: [...others, edit] };
+    });
+    setLines((current) =>
+      current.map((other) => (other.id === line.id ? { ...other, corrected } : other)),
+    );
+  };
+
+  const clearCorrections = () => {
+    setCorrections(NO_CORRECTIONS);
+    setShowFixes(false);
   };
 
   const startRecognizer = () => {
@@ -124,12 +188,12 @@ export default function CaptionsScreen() {
         ref={scrollRef}
         style={styles.captions}
         onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}>
-        {lines.map((line, index) => (
-          <Text key={index} style={styles.line}>
-            {line}
+        {lines.map((line) => (
+          <Text key={line.id} style={styles.line} onPress={() => setEditingLine(line)}>
+            {line.corrected ?? toShownText(line.raw)}
           </Text>
         ))}
-        {interim ? <Text style={[styles.line, styles.interim]}>{interim}</Text> : null}
+        {interim ? <Text style={[styles.line, styles.interim]}>{toShownText(interim)}</Text> : null}
       </ScrollView>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -150,7 +214,28 @@ export default function CaptionsScreen() {
           style={[styles.button, styles.buttonClear]}>
           <Text style={styles.buttonText}>Clear</Text>
         </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => setShowFixes(true)}
+          style={[styles.button, styles.buttonClear]}>
+          <Text style={styles.buttonText}>Fixes</Text>
+        </Pressable>
       </View>
+
+      {editingLine ? (
+        <EditLineModal
+          text={editingLine.corrected ?? toShownText(editingLine.raw)}
+          onSave={(text) => saveEdit(editingLine, text)}
+          onCancel={() => setEditingLine(null)}
+        />
+      ) : null}
+      {showFixes ? (
+        <FixesPanel
+          corrections={corrections}
+          onClear={clearCorrections}
+          onClose={() => setShowFixes(false)}
+        />
+      ) : null}
     </SafeAreaView>
   );
 }
